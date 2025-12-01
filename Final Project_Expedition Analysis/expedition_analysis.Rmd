@@ -1,0 +1,219 @@
+
+---
+title: "Expedition Data Analysis"
+author: "ChatGPT"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(caret)
+library(pROC)
+library(factoextra)
+library(cluster)
+set.seed(2025)
+```
+
+# 1. Dataset choice and brief description
+
+We analyze the uploaded `expeditions.csv` file (mountaineering expedition records). Below is a codebook-style description produced from the data.
+
+## 1.1 Codebook (columns)
+
+- `expedition_id` (character): unique expedition identifier.
+- `peak_id` (character): unique peak identifier.
+- `peak_name` (character): mountain peak name (e.g., "Everest", "Ama Dablam").
+- `year` (integer): calendar year of the expedition (range in this dataset ~1905–2019).
+- `season` (factor/character): season of the expedition (Autumn, Spring, Winter, Summer, Unknown).
+- `basecamp_date` (date / character): date at basecamp (many missing).
+- `highpoint_date` (date / character): date of high point (many missing).
+- `termination_date` (date / character): date expedition terminated (many missing).
+- `termination_reason` (factor/character): outcome or reason (e.g., "Success (main peak)", "Bad weather ...", "Illness ...", "Accident ...").
+- `highpoint_metres` (numeric): maximum elevation reached in metres (NA for some rows).
+- `members` (integer): number of members in the expedition.
+- `member_deaths` (integer): number of member deaths on the expedition.
+- `hired_staff` (integer): number of hired staff (guides, porters etc).
+- `hired_staff_deaths` (integer): number of hired staff deaths.
+- `oxygen_used` (logical): whether supplemental oxygen was used (TRUE/FALSE).
+- `trekking_agency` (character): agency name if present (many missing).
+
+## 1.2 Quick dataset summary
+```{r data-summary}
+exp <- read_csv('expeditions.csv', show_col_types = FALSE)
+
+glimpse(exp)
+summary(exp %>% select(year, highpoint_metres, members, member_deaths, hired_staff, hired_staff_deaths))
+table(exp$season)
+table(exp$termination_reason) %>% head(10)
+table(exp$oxygen_used)
+nrow(exp)
+```
+
+# 2. Questions we'll investigate
+
+1. How has expedition activity changed over years (counts per year)?  
+2. What are the main termination reasons and how do they relate to oxygen use?  
+3. Can we use dimensionality reduction to visualize expedition profiles and cluster them?  
+4. Can a simple classifier predict "Success (main peak)" versus other outcomes using basic expedition features?
+
+# 3. Exploratory Data Analysis (figures)
+
+```{r preprocessing}
+# Basic pre-processing for analysis
+exp2 <- exp %>%
+  mutate(across(c(basecamp_date, highpoint_date, termination_date), ~ parse_date_time(., orders = c('Ymd', 'Y-m-d', 'dmy', 'ymd', 'Y')))) %>%
+  mutate(termination_reason = as.factor(termination_reason),
+         season = as.factor(season),
+         peak_name = as.factor(peak_name),
+         success_main = ifelse(termination_reason == 'Success (main peak)', 1, 0),
+         oxygen_used = as.logical(oxygen_used))
+
+# numeric vars for multivariate methods
+num_vars <- exp2 %>% select(highpoint_metres, members, member_deaths, hired_staff, hired_staff_deaths) %>% mutate(across(everything(), ~replace_na(.,0)))
+```
+
+## Figure 1 — Expeditions per year (time series)
+```{r fig1}
+exp2 %>%
+  count(year) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_line() + geom_point(size = 0.7) +
+  labs(title = 'Number of Expeditions per Year', x = 'Year', y = 'Count') +
+  theme_minimal()
+```
+
+## Figure 2 — Top termination reasons (bar)
+```{r fig2}
+exp2 %>%
+  count(termination_reason, sort = TRUE) %>%
+  slice_max(n, n = 12) %>%
+  mutate(termination_reason = fct_reorder(termination_reason, n)) %>%
+  ggplot(aes(x = termination_reason, y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = 'Top Termination Reasons', x = 'Termination Reason', y = 'Count') +
+  theme_minimal()
+```
+
+## Figure 3 — Oxygen use vs termination outcome (stacked bar / proportion)
+```{r fig3}
+exp2 %>%
+  count(oxygen_used, termination_reason) %>%
+  group_by(oxygen_used) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  filter(termination_reason %in% c('Success (main peak)', 'Accident (death or serious injury)', 'Illness, AMS, exhaustion, or frostbite', 'Bad weather (storms, high winds)', 'Bad conditions (deep snow, avalanching, falling ice, or rock)')) %>%
+  ggplot(aes(x = oxygen_used, y = prop, fill = termination_reason)) +
+  geom_col(position = 'stack') +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = 'Termination outcomes (proportion) by Oxygen Use', x = 'Oxygen used', y = 'Proportion') +
+  theme_minimal()
+```
+
+## Figure 4 — Members distribution by termination reason (boxplot)
+```{r fig4}
+exp2 %>%
+  filter(members > 0) %>%
+  group_by(termination_reason) %>%
+  filter(n() > 30) %>% # only plot common categories
+  ungroup() %>%
+  mutate(termination_reason = fct_lump(termination_reason, n = 8)) %>%
+  ggplot(aes(x = termination_reason, y = members)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = 'Distribution of Members by (top) Termination Reasons', x = '', y = 'Number of members') +
+  theme_minimal()
+```
+
+# 4. Dimensionality reduction + clustering
+
+We perform PCA on selected numeric features and run k-means to find clusters. We'll visualize PCA PC1 vs PC2 colored by cluster and inspect cluster summaries.
+
+```{r pca-cluster}
+# scale numeric variables
+num_scaled <- scale(num_vars)
+pca_res <- prcomp(num_scaled, center = TRUE, scale. = TRUE)
+
+# kmeans (k = 4 chosen as example)
+k4 <- kmeans(num_scaled, centers = 4, nstart = 50)
+exp2$cluster_k4 <- factor(k4$cluster)
+
+# Variance explained
+summary(pca_res)
+
+# Plot PC1 vs PC2 with clusters
+pca_df <- as.data.frame(pca_res$x) %>% select(PC1, PC2) %>% bind_cols(exp2 %>% select(termination_reason, peak_name, success_main, oxygen_used, cluster_k4))
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster_k4)) +
+  geom_point(alpha = 0.6, size = 1) +
+  labs(title = 'PCA: PC1 vs PC2 with k-means(4) clusters') +
+  theme_minimal()
+```
+
+```{r cluster-summary}
+# cluster centroids (back to original variable scale)
+centroids <- as.data.frame(k4$centers) %>% mutate(cluster = row_number())
+centroids
+```
+
+# 5. Classification / Regression
+
+We build a logistic regression classifier to predict `success_main` (1 if success at main peak) using a few predictors. We'll evaluate via train/test split and report AUC.
+
+```{r classification}
+# prepare modelling dataset
+mod_df <- exp2 %>%
+  mutate(highpoint_metres = replace_na(highpoint_metres, 0)) %>%
+  select(success_main, oxygen_used, members, highpoint_metres, hired_staff, year) %>%
+  mutate(oxygen_used = as.integer(oxygen_used))
+
+set.seed(2025)
+train_index <- createDataPartition(mod_df$success_main, p = .7, list = FALSE)
+train <- mod_df[train_index,]
+test  <- mod_df[-train_index,]
+
+glm_fit <- glm(success_main ~ oxygen_used + members + highpoint_metres + hired_staff + year, data = train, family = binomial)
+summary(glm_fit)
+
+# Predictions & performance
+preds <- predict(glm_fit, newdata = test, type = 'response')
+roc_obj <- roc(test$success_main, preds)
+auc_val <- auc(roc_obj)
+
+cat('AUC on test set:', round(auc_val,3), '\n')
+
+# Plot ROC
+plot(roc_obj, main = paste('ROC curve (AUC =', round(auc_val,3), ')'))
+```
+
+# 6. Findings (answers to our questions) and plausible interpretations
+
+**Q1 — How has expedition activity changed over years?**  
+- Visual inspection (Figure 1) shows a long-term rise in documented expeditions with peaks in recent decades (post-1990s). This may reflect both increased activity and improved reporting. Next steps: normalize by number of peaks recorded or look at per-peak rates.
+
+**Q2 — Main termination reasons and oxygen relation?**  
+- `Success (main peak)` is the single largest category (many expeditions). Oxygen-using expeditions have a higher absolute share of "Success" but oxygen use is also associated with other outcomes (accidents, illness). This suggests oxygen is deployed on high-risk high-altitude attempts (confounding by peak and elevation). Next step: stratify by `highpoint_metres` or peak.
+
+**Q3 — PCA + clustering insights**  
+- PCA on numeric variables helps separate expeditions by scale (number of members, staff, deaths) and maximum altitude. K-means clusters identify groups such as small recreational climbs vs large commercial expeditions. Next: profile clusters by peak_name and termination_reason to interpret clusters.
+
+**Q4 — Can we predict success?**  
+- A simple logistic model using oxygen use, member counts, altitude and hired staff gives a modest AUC (reported in the notebook). Predictive power is limited — success depends on many unobserved factors (route conditions, team experience, weather). Next steps: add features (agency reputation, season, year interactions), use tree-based models (random forest), and control for peak fixed effects.
+
+# 7. What I would do next (recommendations)
+- Add peak fixed effects or analyze per-peak subsets (e.g., only Everest) to control for peak-specific difficulty.  
+- Use time-dependent covariates (season, year) and interaction terms.  
+- If available, incorporate team experience or leader info.  
+- Try more powerful models (random forest, xgboost) and cross-validation.  
+- For causal questions about oxygen and success, use stratification or matching on peak and elevation to reduce confounding.
+
+# Appendix — Reproducibility
+Run `rmarkdown::render('expedition_analysis.Rmd')` to produce the HTML report.
+
